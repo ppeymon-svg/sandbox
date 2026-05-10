@@ -7,6 +7,20 @@ on:
         description: 'Target URLs (Separate with space, comma, or new line)'
         required: true
         type: string
+      youtube_method:
+        description: 'YouTube Download Method'
+        required: true
+        type: choice
+        options:
+          - 'Fast API (No Cookies needed - Fastest)'
+          - 'yt-dlp (Reliable - Use this if you have Cookies)'
+      split_method:
+        description: 'How to split files larger than 95MB?'
+        required: true
+        type: choice
+        options:
+          - 'Archive (7z - Creates .001, .002 files - Best for Movies/APKs)'
+          - 'Video Chunks (FFmpeg - Cuts video into 5-min playable MP4 parts)'
       quality:
         description: 'Video Quality (for supported extractors)'
         required: true
@@ -65,8 +79,6 @@ jobs:
           BUNKRR_DOMAINS = ("bunkr.si", "bunkr.fi", "bunkr.ru", "bunkr.cr", "bunkr.rip", "bunkrr.su")
           BUNKRR_DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://get.bunkrr.su/"}
           _offline_subs = set()
-
-          def is_bunkr_url(url): return any(dom in url for dom in BUNKRR_DOMAINS)
           
           def get_slug(url): 
               match = re.search(r"/([a-zA-Z0-9_-]+)(?:\?|/|$)", url)
@@ -166,6 +178,7 @@ jobs:
         run: |
           RAW_URLS="${{ github.event.inputs.url }}"
           QUALITY="${{ github.event.inputs.quality }}"
+          YT_METHOD="${{ github.event.inputs.youtube_method }}"
           
           FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
           
@@ -186,93 +199,117 @@ jobs:
 
           install_heavy_tools() {
             if [ ! -f "/usr/local/bin/yt-dlp" ]; then
-              echo "⏳ Installing fallback tools (yt-dlp, ffmpeg, aria2, bun)..."
+              echo "⏳ Installing heavy tools (yt-dlp, aria2, bun)..."
               sudo apt-get update -qq
-              sudo apt-get install -y --no-install-recommends ffmpeg aria2 > /dev/null 2>&1
+              sudo apt-get install -y --no-install-recommends aria2 > /dev/null 2>&1
               sudo curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
               sudo chmod a+rx /usr/local/bin/yt-dlp
               curl -fsSL https://bun.com/install | bash > /dev/null 2>&1
               export PATH="$HOME/.bun/bin:$PATH"
-              echo "✅ Fallback tools installed successfully!"
             fi
           }
 
           for URL in $FORMATTED_URLS; do
             if [ -z "$URL" ]; then continue; fi
-            
-            echo "==========================================="
             echo "Processing URL: $URL"
-            echo "==========================================="
 
             if echo "$URL" | grep -qE "(bunkr\.si|bunkr\.fi|bunkr\.ru|bunkr\.cr|bunkr\.rip|bunkrr\.su)"; then
-              echo "Downloading from Bunkr..."
               python3 bunkr.py "$URL" "tmp_downloads"
               
             elif echo "$URL" | grep -qE "(youtube\.com|youtu\.be)"; then
-              echo "Attempting to download via fast API (No cookies needed)..."
-              
-              if python3 yt_api.py "$URL" "$QUALITY" "tmp_downloads"; then
-                echo "✅ Downloaded successfully via fast API!"
+              if [[ "$YT_METHOD" == *"Fast API"* ]]; then
+                if python3 yt_api.py "$URL" "$QUALITY" "tmp_downloads"; then
+                  echo "Downloaded via Fast API"
+                else
+                  echo "API Failed. Falling back to yt-dlp..."
+                  install_heavy_tools
+                  COOKIE_ARG=""
+                  [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+                  yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+                fi
               else
-                echo "⚠️ API failed or timed out. Falling back to yt-dlp..."
                 install_heavy_tools
-                
                 COOKIE_ARG=""
                 [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
                 yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
               fi
             
             elif echo "$URL" | grep -qE "(twitch\.tv|reddit\.com|vimeo|soundcloud)"; then
-              echo "Downloading with yt-dlp..."
               install_heavy_tools
-              
               COOKIE_ARG=""
               [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
               yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
               
             else
-              echo "Downloading direct file with aria2..."
               install_heavy_tools
-              
               aria2c --content-disposition-default-utf8=true --split=2 --max-connection-per-server=2 --dir="tmp_downloads" "$URL"
             fi
           done
 
-      - name: Zip & Split
+      - name: Split & Zip
         shell: bash
         run: |
           HAS_PASS="${{ github.event.inputs.password }}"
-
+          SPLIT_METHOD="${{ github.event.inputs.split_method }}"
+          
+          rm -f dl/*.part.* dl/*.7z.* dl/*.zip 2>/dev/null || true
+          touch new_files.txt
+          
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
             SIZE=$(stat -c%s "$FILE")
             LIMIT=$((95 * 1024 * 1024))
             BASENAME=$(basename "$FILE")
+            NAME_WITHOUT_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
             
-            rm -f "dl/${BASENAME}.zip"*
-            
-            if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Zipping/Splitting: $BASENAME"
+            # Condition 1: File is larger than 95MB
+            if [ "$SIZE" -gt "$LIMIT" ]; then
               
-              if ! command -v 7z &> /dev/null; then
-                echo "⏳ Installing 7z for splitting large files..."
-                sudo apt-get update -qq
-                sudo apt-get install -y --no-install-recommends p7zip-full > /dev/null 2>&1
-              fi
-              
-              if [ -n "$HAS_PASS" ]; then
-                7z a -tzip -v95m -p"$HAS_PASS" "dl/${BASENAME}.zip" "$FILE"
-              else
-                7z a -tzip -v95m "dl/${BASENAME}.zip" "$FILE"
-              fi
-              
-              for ZPART in "dl/${BASENAME}".zip.00*; do
-                if [ -f "$ZPART" ]; then
-                  basename "$ZPART" >> new_files.txt
+              # If user chose Video Chunking AND file is a video
+              if [[ "$SPLIT_METHOD" == *"Video Chunks"* ]] && [[ "$EXT" =~ ^(mp4|mkv|avi|webm)$ ]]; then
+                echo "Splitting large video into chunks: $BASENAME"
+                if ! command -v ffmpeg &> /dev/null; then
+                  sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg > /dev/null 2>&1
                 fi
-              done
+                
+                # Using fast & robust segment muxer
+                ffmpeg -i "$FILE" -c copy -f segment -segment_time 300 -reset_timestamps 1 "dl/${NAME_WITHOUT_EXT}_part_%03d.${EXT}" -y 2>/dev/null
+                
+                for PART in "dl/${NAME_WITHOUT_EXT}_part_"*; do
+                  [ -f "$PART" ] && basename "$PART" >> new_files.txt
+                done
+              
+              # Otherwise (Archive method OR file is not a video)
+              else
+                echo "Splitting large file via 7z Archive: $BASENAME"
+                if ! command -v 7z &> /dev/null; then
+                  sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends p7zip-full > /dev/null 2>&1
+                fi
+                
+                if [ -n "$HAS_PASS" ]; then
+                  7z a -v95m -p"$HAS_PASS" -mhe=on "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+                else
+                  7z a -v95m "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+                fi
+                
+                for ZPART in "dl/${NAME_WITHOUT_EXT}".7z.00*; do
+                  [ -f "$ZPART" ] && basename "$ZPART" >> new_files.txt
+                done
+              fi
+              
+            # Condition 2: Small file but needs password
+            elif [ -n "$HAS_PASS" ]; then
+              echo "Encrypting small file: $BASENAME"
+              if ! command -v 7z &> /dev/null; then
+                sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends p7zip-full > /dev/null 2>&1
+              fi
+              7z a -p"$HAS_PASS" -mhe=on "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+              echo "${NAME_WITHOUT_EXT}.7z" >> new_files.txt
+              
+            # Condition 3: Small file, no password
             else
-              echo "File is under 95MB. Copying raw file (No Zip)..."
+              echo "Copying raw file: $BASENAME"
               cp -f "$FILE" "dl/$BASENAME"
               echo "$BASENAME" >> new_files.txt
             fi
@@ -282,16 +319,16 @@ jobs:
       - name: Update Links.md
         shell: bash
         run: |
-          [ ! -f new_files.txt ] && exit 0
+          [ ! -s new_files.txt ] && exit 0
           
           REPO="${{ github.repository }}"
           BRANCH="${GITHUB_REF_NAME}"
           
           HEADER="## 🔗 Direct Download Links\n> Click on any link below to start downloading directly.<br><br/>\n\n"
-          
           echo "### 📅 $(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M') IR" > current_run.md
           
           while IFS= read -r FNAME; do
+            [ -z "$FNAME" ] && continue
             ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "$FNAME")
             RAW_URL="https://github.com/$REPO/raw/$BRANCH/dl/$ENCODED_NAME"
             
@@ -300,14 +337,18 @@ jobs:
             export FNAME_ENV="$FNAME"
             SIZE_STR=$(python3 -c "import os; fname = os.environ.get('FNAME_ENV'); path = f'dl/{fname}'; size = os.path.getsize(path) if os.path.exists(path) else 0; print(f'{size/1048576:.1f}MB' if size >= 1048576 else f'{size//1024}KB')")
             
-            EXT="${FNAME##*.}"
-            case "$EXT" in
-              apk)             ICON="📱" ;;
-              mp4|mkv|avi|mov) ICON="🎬" ;;
-              mp3|m4a|flac|ogg) ICON="🎵" ;;
-              zip|00[1-9]*)    ICON="🗜️" ;;
-              *)               ICON="📥" ;;
-            esac
+            if [[ "$FNAME" == *"_part_"* ]]; then
+              ICON="🎬 (Part)"
+            else
+              EXT="${FNAME##*.}"
+              case "$EXT" in
+                apk)             ICON="📱" ;;
+                mp4|mkv|avi|mov) ICON="🎬" ;;
+                mp3|m4a|flac|ogg) ICON="🎵" ;;
+                00[1-9]*|7z)     ICON="🗜️" ;;
+                *)               ICON="📥" ;;
+              esac
+            fi
             
             echo "- $ICON [$DISPLAY_NAME]($RAW_URL) \`$SIZE_STR\`" >> current_run.md
             echo "" >> current_run.md
@@ -325,7 +366,6 @@ jobs:
             echo -e "$HEADER" > Links.md
             cat current_run.md >> Links.md
           fi
-          
           rm -f new_files.txt current_run.md
 
       - name: Push to Repository
