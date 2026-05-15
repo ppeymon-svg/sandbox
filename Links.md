@@ -2,6 +2,12 @@
 > Click on any link below to start downloading directly.<br><br/>
 
 
+### 📅 2026-05-15 13:44 IR
+- 🎵 [FDRX_-_NOXSOL_(Official_Music_Video).mp3](https://github.com/ppeymon-svg/sandbox/raw/main/dl/FDRX_-_NOXSOL_%28Official_Music_Video%29.mp3) `12.0MB`
+
+---
+
+
 ### 📅 2026-05-15 13:23 IR
 - 🎵 [LOWX,_LAGXNA_-_ALONE.mp3](https://github.com/ppeymon-svg/sandbox/raw/main/dl/LOWX%2C_LAGXNA_-_ALONE.mp3) `6.7MB`
 
